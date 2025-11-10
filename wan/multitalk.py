@@ -126,7 +126,8 @@ class InfiniteTalkPipeline:
         quant = None,
         dit_path = None,
         infinitetalk_dir=None,
-    ):
+        block_swap_args: dict = None,   # <-- 新增参数（可选）
+        ):
         r"""
         Initializes the image-to-video generation model components.
 
@@ -282,6 +283,28 @@ class InfiniteTalkPipeline:
         self.cpu_offload = False
         self.model_names = ["model"]
         self.vram_management = False
+        
+        if block_swap_args is not None:
+        # 默认字段（保证向后兼容）
+            blocks_to_swap = int(block_swap_args.get("blocks_to_swap", 0))
+            offload_img_emb = bool(block_swap_args.get("offload_img_emb", False))
+            offload_txt_emb = bool(block_swap_args.get("offload_txt_emb", False))
+            vace_blocks_to_swap = int(block_swap_args.get("vace_blocks_to_swap", 0))
+            prefetch_blocks = int(block_swap_args.get("prefetch_blocks", 0))
+            use_non_blocking = bool(block_swap_args.get("use_non_blocking", False))
+            block_swap_debug = bool(block_swap_args.get("block_swap_debug", False))
+
+            # ensure model has block_swap method
+            if hasattr(self.model, "block_swap"):
+                self.model.block_swap(
+                    blocks_to_swap=blocks_to_swap,
+                    offload_txt_emb=offload_txt_emb,
+                    offload_img_emb=offload_img_emb,
+                    vace_blocks_to_swap=vace_blocks_to_swap,
+                    prefetch_blocks=prefetch_blocks,
+                    use_non_blocking=use_non_blocking,
+                    block_swap_debug=block_swap_debug
+                )
 
     def add_noise(
         self,
