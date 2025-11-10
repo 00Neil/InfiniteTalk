@@ -7,13 +7,18 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Added imports for block-swap functionality
+import types
+import time
+import logging
+
 from einops import rearrange
 from diffusers import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 from .attention import flash_attention, SingleStreamMutiAttention
 from ..utils.multitalk_utils import get_attn_map_with_target
-import logging
+
 try:
     from sageattention import sageattn
     USE_SAGEATTN = True
@@ -22,7 +27,6 @@ except:
     USE_SAGEATTN = False
 
 __all__ = ['WanModel']
-
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -554,6 +558,139 @@ class WanModel(ModelMixin, ConfigMixin):
         ],
                                dim=1)
 
+    # === BEGIN ADDED: block-swap support ===
+    def block_swap(self,
+                   blocks_to_swap: int,
+                   offload_txt_emb: bool = False,
+                   offload_img_emb: bool = False,
+                   vace_blocks_to_swap: int = 0,
+                   prefetch_blocks: int = 0,
+                   use_non_blocking: bool = False,
+                   block_swap_debug: bool = False):
+        """
+        Initialize block-swap: place the last `blocks_to_swap` transformer blocks onto
+        offload_device (default CPU). At runtime the wrapped block.forward will
+        ensure the block is moved to main_device for compute and moved back after execute.
+
+        This method does a best-effort device placement and monkey-patches block.forward
+        to perform just-in-time onload/offload. It also prepares optional CUDA streams/events
+        for prefetching if prefetch_blocks > 0.
+        """
+        # devices
+        self.main_device = getattr(self, "main_device", getattr(self, "device", torch.device("cuda")))
+        self.offload_device = getattr(self, "offload_device", torch.device("cpu"))
+
+        self.blocks_to_swap = max(0, min(int(blocks_to_swap), len(getattr(self, "blocks", []))))
+        self.vace_blocks_to_swap = int(vace_blocks_to_swap) if vace_blocks_to_swap is not None else 0
+        self.prefetch_blocks = max(0, int(prefetch_blocks))
+        self.use_non_blocking = use_non_blocking
+        self.block_swap_debug = block_swap_debug
+        self.offload_img_emb = offload_img_emb
+        self.offload_txt_emb = offload_txt_emb
+
+        blocks = getattr(self, "blocks", [])
+        n_blocks = len(blocks)
+        swap_start_idx = n_blocks - self.blocks_to_swap
+        self._block_swap_start_idx = swap_start_idx
+
+        # prepare cuda stream and events for prefetch if requested
+        self._bs_cuda_stream = None
+        self._bs_events = None
+        if torch.cuda.is_available() and self.prefetch_blocks > 0:
+            try:
+                self._bs_cuda_stream = torch.cuda.Stream()
+                self._bs_events = [torch.cuda.Event(enable_timing=False, blocking=False) for _ in range(n_blocks)]
+            except Exception as e:
+                logging.warning(f"[block-swap] failed to create cuda stream/events: {e}")
+                self._bs_cuda_stream = None
+                self._bs_events = None
+
+        total_main, total_offload = 0, 0
+        # initial placement: non-swapped to main, swapped to offload
+        for i, block in enumerate(blocks):
+            try:
+                if i < swap_start_idx:
+                    block.to(self.main_device)
+                    total_main += 1
+                else:
+                    block.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    total_offload += 1
+            except Exception as e:
+                logging.debug(f"[block-swap] placement best-effort failed for block {i}: {e}")
+
+        # monkey-patch forward for swapped blocks to move them just-in-time.
+        for i, block in enumerate(blocks):
+            original_forward = getattr(block, "forward", None)
+            if original_forward is None:
+                continue
+
+            def make_wrapped_forward(orig_forward, idx):
+                def wrapped_forward(this, *args, **kwargs):
+                    # Wait for prefetch event if present
+                    if idx >= self._block_swap_start_idx and self.blocks_to_swap > 0:
+                        if self._bs_events is not None:
+                            ev = self._bs_events[idx]
+                            try:
+                                if not ev.query():
+                                    ev.synchronize()
+                            except Exception:
+                                pass
+                        # Move module to main device for compute
+                        try:
+                            this.to(self.main_device)
+                        except Exception as e:
+                            logging.debug(f"[block-swap] to(main) failed for block {idx}: {e}")
+
+                    start_t = time.perf_counter() if self.block_swap_debug else None
+                    out = orig_forward(this, *args, **kwargs)
+                    end_t = time.perf_counter() if self.block_swap_debug else None
+
+                    # Move back to offload to free memory
+                    if idx >= self._block_swap_start_idx and self.blocks_to_swap > 0:
+                        try:
+                            this.to(self.offload_device, non_blocking=self.use_non_blocking)
+                        except Exception as e:
+                            logging.debug(f"[block-swap] to(offload) failed for block {idx}: {e}")
+
+                    # debug logging
+                    if self.block_swap_debug and start_t is not None:
+                        compute_time = end_t - start_t
+                        logging.info(f"[block-swap] block {idx} compute_time={compute_time:.4f}s")
+
+                    return out
+                return wrapped_forward
+
+            try:
+                wrapped = make_wrapped_forward(original_forward, i)
+                block.forward = types.MethodType(wrapped, block)
+            except Exception as e:
+                logging.debug(f"[block-swap] monkey patch failed for block {i}: {e}")
+
+        # VACE blocks placement (if present)
+        if hasattr(self, "vace_blocks") and self.vace_blocks is not None and self.vace_blocks_to_swap > 0:
+            vblocks = self.vace_blocks
+            n_v = len(vblocks)
+            vstart = max(0, n_v - self.vace_blocks_to_swap)
+            self._vace_swap_start_idx = vstart
+            for i, vblk in enumerate(vblocks):
+                try:
+                    if i < vstart:
+                        vblk.to(self.main_device)
+                    else:
+                        vblk.to(self.offload_device, non_blocking=self.use_non_blocking)
+                except Exception as e:
+                    logging.debug(f"[block-swap] vace placement failed for vblock {i}: {e}")
+
+        # try to free cuda cache
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        logging.info(f"[block-swap] initialized: total_main={total_main}, total_offload={total_offload}, swap_start_idx={swap_start_idx}, prefetch={self.prefetch_blocks}")
+    # === END ADDED ===
+
     def teacache_init(
         self,
         use_ret_steps=True,
@@ -772,7 +909,6 @@ class WanModel(ModelMixin, ConfigMixin):
                 self.cnt = 0
 
         return torch.stack(x).float()
-
 
     def unpatchify(self, x, grid_sizes):
         r"""
